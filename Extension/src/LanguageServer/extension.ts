@@ -23,6 +23,7 @@ import * as telemetry from '../telemetry';
 import { Client, DefaultClient, DoxygenCodeActionCommandArguments, openFileVersions } from './client';
 import { ClientCollection } from './clientCollection';
 import { CodeActionDiagnosticInfo, CodeAnalysisDiagnosticIdentifiersAndUri, codeAnalysisAllFixes, codeAnalysisCodeToFixes, codeAnalysisFileToCodeActions } from './codeAnalysis';
+import { registerRelatedFilesProvider } from './copilotProviders';
 import { CppBuildTaskProvider } from './cppBuildTaskProvider';
 import { getCustomConfigProviders } from './customProviders';
 import { getLanguageConfig } from './languageConfig';
@@ -32,13 +33,6 @@ import { NodeType, TreeNode } from './referencesModel';
 import { CppSettings } from './settings';
 import { LanguageStatusUI, getUI } from './ui';
 import { makeLspRange, rangeEquals, showInstallCompilerWalkthrough } from './utils';
-
-interface CopilotApi {
-    registerRelatedFilesProvider(
-        providerId: { extensionId: string; languageId: string },
-        callback: (uri: vscode.Uri) => Promise<{ entries: vscode.Uri[]; traits?: { name: string; value: string }[] }>
-    ): void;
-}
 
 nls.config({ messageFormat: nls.MessageFormat.bundle, bundleFormat: nls.BundleFormat.standalone })();
 const localize: nls.LocalizeFunc = nls.loadMessageBundle();
@@ -176,6 +170,7 @@ export async function activate(): Promise<void> {
     });
 
     disposables.push(vscode.workspace.onDidChangeConfiguration(onDidChangeSettings));
+    disposables.push(vscode.workspace.onDidChangeTextDocument(onDidChangeTextDocument));
     disposables.push(vscode.window.onDidChangeTextEditorVisibleRanges((e) => clients.ActiveClient.enqueue(async () => onDidChangeTextEditorVisibleRanges(e))));
     disposables.push(vscode.window.onDidChangeActiveTextEditor((e) => clients.ActiveClient.enqueue(async () => onDidChangeActiveTextEditor(e))));
     ui.didChangeActiveEditor(); // Handle already active documents (for non-cpp files that we don't register didOpen).
@@ -190,8 +185,7 @@ export async function activate(): Promise<void> {
 
     void clients.ActiveClient.ready.then(() => intervalTimer = global.setInterval(onInterval, 2500));
 
-    const isRelatedFilesApiEnabled = await telemetry.isExperimentEnabled("CppToolsRelatedFilesApi");
-    registerCommands(true, isRelatedFilesApiEnabled);
+    await registerCommands(true);
 
     vscode.tasks.onDidStartTask(() => getActiveClient().PauseCodeAnalysis());
 
@@ -263,22 +257,7 @@ export async function activate(): Promise<void> {
         disposables.push(tool);
     }
 
-    if (isRelatedFilesApiEnabled) {
-        const api = await getCopilotApi();
-        if (util.extensionContext && api) {
-            try {
-                for (const languageId of ['c', 'cpp', 'cuda-cpp']) {
-                    api.registerRelatedFilesProvider(
-                        { extensionId: util.extensionContext.extension.id, languageId },
-                        async (_uri: vscode.Uri) =>
-                            ({ entries: (await clients.ActiveClient.getIncludes(1))?.includedFiles.map(file => vscode.Uri.file(file)) ?? [] })
-                    );
-                }
-            } catch {
-                console.log("Failed to register Copilot related files provider.");
-            }
-        }
-    }
+    await registerRelatedFilesProvider();
 }
 
 export function updateLanguageConfigurations(): void {
@@ -308,6 +287,11 @@ async function onDidChangeSettings(event: vscode.ConfigurationChangeEvent): Prom
             UpdateInsidersAccess();
         }
     }
+}
+
+async function onDidChangeTextDocument(event: vscode.TextDocumentChangeEvent): Promise<void> {
+    const me: Client = clients.getClientFor(event.document.uri);
+    me.onDidChangeTextDocument(event);
 }
 
 let noActiveEditorTimeout: NodeJS.Timeout | undefined;
@@ -375,7 +359,7 @@ function onInterval(): void {
 /**
  * registered commands
  */
-export function registerCommands(enabled: boolean, isRelatedFilesApiEnabled: boolean): void {
+export async function registerCommands(enabled: boolean): Promise<void> {
     commandDisposables.forEach(d => d.dispose());
     commandDisposables.length = 0;
     commandDisposables.push(vscode.commands.registerCommand('C_Cpp.SwitchHeaderSource', enabled ? onSwitchHeaderSource : onDisabledCommand));
@@ -433,10 +417,6 @@ export function registerCommands(enabled: boolean, isRelatedFilesApiEnabled: boo
     commandDisposables.push(vscode.commands.registerCommand('C_Cpp.ExtractToFreeFunction', enabled ? () => onExtractToFunction(true, false) : onDisabledCommand));
     commandDisposables.push(vscode.commands.registerCommand('C_Cpp.ExtractToMemberFunction', enabled ? () => onExtractToFunction(false, true) : onDisabledCommand));
     commandDisposables.push(vscode.commands.registerCommand('C_Cpp.ExpandSelection', enabled ? (r: Range) => onExpandSelection(r) : onDisabledCommand));
-
-    if (!isRelatedFilesApiEnabled) {
-        commandDisposables.push(vscode.commands.registerCommand('C_Cpp.getIncludes', enabled ? (maxDepth: number) => getIncludes(maxDepth) : () => Promise.resolve()));
-    }
 }
 
 function onDisabledCommand() {
@@ -1399,27 +1379,5 @@ export async function preReleaseCheck(): Promise<void> {
                 }
             });
         }
-    }
-}
-
-export async function getIncludes(maxDepth: number): Promise<any> {
-    const includes = await clients.ActiveClient.getIncludes(maxDepth);
-    return includes;
-}
-
-async function getCopilotApi(): Promise<CopilotApi | undefined> {
-    const copilotExtension = vscode.extensions.getExtension<CopilotApi>('github.copilot');
-    if (!copilotExtension) {
-        return undefined;
-    }
-
-    if (!copilotExtension.isActive) {
-        try {
-            return await copilotExtension.activate();
-        } catch {
-            return undefined;
-        }
-    } else {
-        return copilotExtension.exports;
     }
 }
