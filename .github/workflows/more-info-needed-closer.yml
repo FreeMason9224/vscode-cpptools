@@ -16,6 +16,11 @@ jobs:
     steps:
       - name: Checkout Actions
         uses: actions/checkout@v2
+      
+      # Add a step to wait for a specific time to avoid rate limiting
+      - name: Wait to avoid rate limit
+        run: sleep 120
+
       - name: Install Actions
         run: cd ./.github/actions && npm install --production && cd ../..
       - name: Stale Closer
