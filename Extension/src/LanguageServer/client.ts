@@ -43,6 +43,7 @@ import { localizedStringCount, lookupString } from '../nativeStrings';
 import { SessionState } from '../sessionState';
 import * as telemetry from '../telemetry';
 import { TestHook, getTestHook } from '../testHook';
+import { CopilotHoverProvider } from './Providers/CopilotHoverProvider';
 import { HoverProvider } from './Providers/HoverProvider';
 import {
     CodeAnalysisDiagnosticIdentifiersAndUri,
@@ -533,12 +534,34 @@ export interface GetIncludesResult {
     includedFiles: string[];
 }
 
+export interface GetCopilotHoverInfoParams {
+    textDocument: TextDocumentIdentifier;
+    position: Position;
+}
+
+interface GetCopilotHoverInfoResult {
+    content: string;
+}
+
 export interface ChatContextResult {
     language: string;
     standardVersion: string;
     compiler: string;
     targetPlatform: string;
     targetArchitecture: string;
+}
+
+export interface FileContextResult {
+    compilerArguments: string[];
+}
+
+export interface ProjectContextResult {
+    language: string;
+    standardVersion: string;
+    compiler: string;
+    targetPlatform: string;
+    targetArchitecture: string;
+    fileContext: FileContextResult;
 }
 
 // Requests
@@ -554,13 +577,15 @@ export const FormatDocumentRequest: RequestType<FormatParams, FormatResult, void
 export const FormatRangeRequest: RequestType<FormatParams, FormatResult, void> = new RequestType<FormatParams, FormatResult, void>('cpptools/formatRange');
 export const FormatOnTypeRequest: RequestType<FormatParams, FormatResult, void> = new RequestType<FormatParams, FormatResult, void>('cpptools/formatOnType');
 export const HoverRequest: RequestType<TextDocumentPositionParams, vscode.Hover, void> = new RequestType<TextDocumentPositionParams, vscode.Hover, void>('cpptools/hover');
+export const GetCopilotHoverInfoRequest: RequestType<GetCopilotHoverInfoParams, GetCopilotHoverInfoResult, void> = new RequestType<GetCopilotHoverInfoParams, GetCopilotHoverInfoResult, void>('cpptools/getCopilotHoverInfo');
 const CreateDeclarationOrDefinitionRequest: RequestType<CreateDeclarationOrDefinitionParams, CreateDeclarationOrDefinitionResult, void> = new RequestType<CreateDeclarationOrDefinitionParams, CreateDeclarationOrDefinitionResult, void>('cpptools/createDeclDef');
 const ExtractToFunctionRequest: RequestType<ExtractToFunctionParams, WorkspaceEditResult, void> = new RequestType<ExtractToFunctionParams, WorkspaceEditResult, void>('cpptools/extractToFunction');
 const GoToDirectiveInGroupRequest: RequestType<GoToDirectiveInGroupParams, Position | undefined, void> = new RequestType<GoToDirectiveInGroupParams, Position | undefined, void>('cpptools/goToDirectiveInGroup');
 const GenerateDoxygenCommentRequest: RequestType<GenerateDoxygenCommentParams, GenerateDoxygenCommentResult | undefined, void> = new RequestType<GenerateDoxygenCommentParams, GenerateDoxygenCommentResult, void>('cpptools/generateDoxygenComment');
 const ChangeCppPropertiesRequest: RequestType<CppPropertiesParams, void, void> = new RequestType<CppPropertiesParams, void, void>('cpptools/didChangeCppProperties');
 const IncludesRequest: RequestType<GetIncludesParams, GetIncludesResult, void> = new RequestType<GetIncludesParams, GetIncludesResult, void>('cpptools/getIncludes');
-const CppContextRequest: RequestType<void, ChatContextResult, void> = new RequestType<void, ChatContextResult, void>('cpptools/getChatContext');
+const CppContextRequest: RequestType<TextDocumentIdentifier, ChatContextResult, void> = new RequestType<TextDocumentIdentifier, ChatContextResult, void>('cpptools/getChatContext');
+const ProjectContextRequest: RequestType<TextDocumentIdentifier, ProjectContextResult, void> = new RequestType<TextDocumentIdentifier, ProjectContextResult, void>('cpptools/getProjectContext');
 
 // Notifications to the server
 const DidOpenNotification: NotificationType<DidOpenTextDocumentParams> = new NotificationType<DidOpenTextDocumentParams>('textDocument/didOpen');
@@ -762,7 +787,7 @@ export interface Client {
     PauseCodeAnalysis(): void;
     ResumeCodeAnalysis(): void;
     CancelCodeAnalysis(): void;
-    handleConfigurationSelectCommand(): Promise<void>;
+    handleConfigurationSelectCommand(config?: string): Promise<void>;
     handleConfigurationProviderSelectCommand(): Promise<void>;
     handleShowActiveCodeAnalysisCommands(): Promise<void>;
     handleShowIdleCodeAnalysisCommands(): Promise<void>;
@@ -790,8 +815,10 @@ export interface Client {
     getShowConfigureIntelliSenseButton(): boolean;
     setShowConfigureIntelliSenseButton(show: boolean): void;
     addTrustedCompiler(path: string): Promise<void>;
-    getIncludes(maxDepth: number, token: vscode.CancellationToken): Promise<GetIncludesResult>;
-    getChatContext(token: vscode.CancellationToken): Promise<ChatContextResult>;
+    getCopilotHoverProvider(): CopilotHoverProvider | undefined;
+    getIncludes(maxDepth: number): Promise<GetIncludesResult>;
+    getChatContext(uri: vscode.Uri, token: vscode.CancellationToken): Promise<ChatContextResult>;
+    getProjectContext(uri: vscode.Uri): Promise<ProjectContextResult>;
 }
 
 export function createClient(workspaceFolder?: vscode.WorkspaceFolder): Client {
@@ -824,11 +851,14 @@ export class DefaultClient implements Client {
     private settingsTracker: SettingsTracker;
     private loggingLevel: number = 1;
     private configurationProvider?: string;
+    private hoverProvider: HoverProvider | undefined;
+    private copilotHoverProvider: CopilotHoverProvider | undefined;
 
     public lastCustomBrowseConfiguration: PersistentFolderState<WorkspaceBrowseConfiguration | undefined> | undefined;
     public lastCustomBrowseConfigurationProviderId: PersistentFolderState<string | undefined> | undefined;
     public lastCustomBrowseConfigurationProviderVersion: PersistentFolderState<Version> | undefined;
     public currentCaseSensitiveFileSupport: PersistentWorkspaceState<boolean> | undefined;
+    public currentCopilotHoverEnabled: PersistentWorkspaceState<string> | undefined;
     private registeredProviders: PersistentFolderState<string[]> | undefined;
 
     private configStateReceived: ConfigStateReceived = { compilers: false, compileCommands: false, configProviders: undefined, timeout: false };
@@ -1046,7 +1076,7 @@ export class DefaultClient implements Client {
             if (index === paths.length - 1) {
                 action = "disable";
                 settings.defaultCompilerPath = "";
-                await this.configuration.updateCompilerPathIfSet(settings.defaultCompilerPath);
+                await this.configuration.updateCompilerPathIfSet("");
                 configurationSelected = true;
                 await this.showPrompt(sender);
                 return ui.ShowConfigureIntelliSenseButton(false, this, ConfigurationType.CompilerPath, "disablePrompt");
@@ -1066,7 +1096,7 @@ export class DefaultClient implements Client {
                 configurationSelected = true;
                 action = "compiler browsed";
                 settings.defaultCompilerPath = result[0].fsPath;
-                await this.configuration.updateCompilerPathIfSet(settings.defaultCompilerPath);
+                await this.configuration.updateCompilerPathIfSet(result[0].fsPath);
                 void SessionState.trustedCompilerFound.set(true);
             } else {
                 configurationSelected = true;
@@ -1084,8 +1114,9 @@ export class DefaultClient implements Client {
                     return ui.ShowConfigureIntelliSenseButton(false, this, ConfigurationType.CompileCommands, showButtonSender);
                 } else {
                     action = "select compiler";
-                    settings.defaultCompilerPath = util.isCl(paths[index]) ? "cl.exe" : paths[index];
-                    await this.configuration.updateCompilerPathIfSet(settings.defaultCompilerPath);
+                    const newCompiler: string = util.isCl(paths[index]) ? "cl.exe" : paths[index];
+                    settings.defaultCompilerPath = newCompiler;
+                    await this.configuration.updateCompilerPathIfSet(newCompiler);
                     void SessionState.trustedCompilerFound.set(true);
                 }
             }
@@ -1257,8 +1288,16 @@ export class DefaultClient implements Client {
                 this.registerFileWatcher();
                 initializedClientCount = 0;
                 this.inlayHintsProvider = new InlayHintsProvider();
+                this.hoverProvider = new HoverProvider(this);
 
-                this.disposables.push(vscode.languages.registerHoverProvider(util.documentSelector, new HoverProvider(this)));
+                const settings: CppSettings = new CppSettings();
+                this.currentCopilotHoverEnabled = new PersistentWorkspaceState<string>("cpp.copilotHover", settings.copilotHover);
+                if (settings.copilotHover === "enabled" ||
+                    (settings.copilotHover === "default" && await telemetry.isFlightEnabled("CppCopilotHover"))) {
+                    this.copilotHoverProvider = new CopilotHoverProvider(this);
+                    this.disposables.push(vscode.languages.registerHoverProvider(util.documentSelector, this.copilotHoverProvider));
+                }
+                this.disposables.push(vscode.languages.registerHoverProvider(util.documentSelector, this.hoverProvider));
                 this.disposables.push(vscode.languages.registerInlayHintsProvider(util.documentSelector, this.inlayHintsProvider));
                 this.disposables.push(vscode.languages.registerRenameProvider(util.documentSelector, new RenameProvider(this)));
                 this.disposables.push(vscode.languages.registerReferenceProvider(util.documentSelector, new FindAllReferencesProvider(this)));
@@ -1276,7 +1315,6 @@ export class DefaultClient implements Client {
                 this.codeFoldingProvider = new FoldingRangeProvider(this);
                 this.codeFoldingProviderDisposable = vscode.languages.registerFoldingRangeProvider(util.documentSelector, this.codeFoldingProvider);
 
-                const settings: CppSettings = new CppSettings();
                 if (settings.isEnhancedColorizationEnabled && semanticTokensLegend) {
                     this.semanticTokensProvider = new SemanticTokensProvider();
                     this.semanticTokensProviderDisposable = vscode.languages.registerDocumentSemanticTokensProvider(util.documentSelector, this.semanticTokensProvider, semanticTokensLegend);
@@ -1284,6 +1322,12 @@ export class DefaultClient implements Client {
 
                 // Listen for messages from the language server.
                 this.registerNotifications();
+
+                // If a file is already open when we activate, sometimes we don't get any notifications about visible
+                // or active text editors, visible ranges, or text selection. As a workaround, we trigger
+                // onDidChangeVisibleTextEditors here.
+                const cppEditors: vscode.TextEditor[] = vscode.window.visibleTextEditors.filter(e => util.isCpp(e.document));
+                await this.onDidChangeVisibleTextEditors(cppEditors);
             }
 
             // update all client configurations
@@ -1451,6 +1495,9 @@ export class DefaultClient implements Client {
         if (this.currentCaseSensitiveFileSupport && workspaceSettings.isCaseSensitiveFileSupportEnabled !== this.currentCaseSensitiveFileSupport.Value) {
             void util.promptForReloadWindowDueToSettingsChange();
         }
+        if (this.currentCopilotHoverEnabled && workspaceSettings.copilotHover !== this.currentCopilotHoverEnabled.Value) {
+            void util.promptForReloadWindowDueToSettingsChange();
+        }
         return {
             filesAssociations: workspaceOtherSettings.filesAssociations,
             workspaceFallbackEncoding: workspaceOtherSettings.filesEncoding,
@@ -1473,6 +1520,7 @@ export class DefaultClient implements Client {
             codeAnalysisMaxConcurrentThreads: workspaceSettings.codeAnalysisMaxConcurrentThreads,
             codeAnalysisMaxMemory: workspaceSettings.codeAnalysisMaxMemory,
             codeAnalysisUpdateDelay: workspaceSettings.codeAnalysisUpdateDelay,
+            copilotHover: workspaceSettings.copilotHover,
             workspaceFolderSettings: workspaceFolderSettingsParams
         };
     }
@@ -1583,6 +1631,12 @@ export class DefaultClient implements Client {
                     // We manually restart the language server so tell the LanguageClient not to do it automatically for us.
                     return { action: CloseAction.DoNotRestart, message };
                 }
+            },
+            markdown: {
+                isTrusted: true
+                // TODO: support for icons in markdown is not yet in the released version of vscode-languageclient.
+                // Based on PR (https://github.com/microsoft/vscode-languageserver-node/pull/1504)
+                //supportThemeIcons: true
             }
 
             // TODO: should I set the output channel? Does this sort output between servers?
@@ -2206,17 +2260,31 @@ export class DefaultClient implements Client {
         await this.languageClient.sendNotification(DidOpenNotification, params);
     }
 
-    public async getIncludes(maxDepth: number, token: vscode.CancellationToken): Promise<GetIncludesResult> {
+    /**
+     * Copilot completion-related requests (e.g. getIncludes and getProjectContext) will have their cancellation tokens cancelled
+     * if the current request times out (showing the user completion results without context info),
+     * but the results can still be used for future requests (due to caching) so it's better to return results instead of cancelling.
+     * This is different behavior from the getChatContext, which does handle cancel requests, since the request blocks
+     * the UI results and always re-requests (no caching).
+    */
+
+    public async getIncludes(maxDepth: number): Promise<GetIncludesResult> {
         const params: GetIncludesParams = { maxDepth: maxDepth };
         await this.ready;
-        return DefaultClient.withLspCancellationHandling(
-            () => this.languageClient.sendRequest(IncludesRequest, params, token), token);
+        return this.languageClient.sendRequest(IncludesRequest, params);
     }
 
-    public async getChatContext(token: vscode.CancellationToken): Promise<ChatContextResult> {
+    public async getProjectContext(uri: vscode.Uri): Promise<ProjectContextResult> {
+        const params: TextDocumentIdentifier = { uri: uri.toString() };
+        await this.ready;
+        return this.languageClient.sendRequest(ProjectContextRequest, params);
+    }
+
+    public async getChatContext(uri: vscode.Uri, token: vscode.CancellationToken): Promise<ChatContextResult> {
+        const params: TextDocumentIdentifier = { uri: uri.toString() };
         await withCancellation(this.ready, token);
         return DefaultClient.withLspCancellationHandling(
-            () => this.languageClient.sendRequest(CppContextRequest, null, token), token);
+            () => this.languageClient.sendRequest(CppContextRequest, params, token), token);
     }
 
     /**
@@ -2310,7 +2378,6 @@ export class DefaultClient implements Client {
                 throw e;
             }
         }
-
         if (token.isCancellationRequested) {
             throw new vscode.CancellationError();
         }
@@ -2387,7 +2454,9 @@ export class DefaultClient implements Client {
         }
 
         this.updateInactiveRegions(intelliSenseResult.uri, intelliSenseResult.inactiveRegions, intelliSenseResult.clearExistingInactiveRegions, intelliSenseResult.isCompletePass);
-        this.updateSquiggles(intelliSenseResult.uri, intelliSenseResult.diagnostics, intelliSenseResult.clearExistingDiagnostics);
+        if (intelliSenseResult.clearExistingDiagnostics || intelliSenseResult.diagnostics.length > 0) {
+            this.updateSquiggles(intelliSenseResult.uri, intelliSenseResult.diagnostics, intelliSenseResult.clearExistingDiagnostics);
+        }
     }
 
     private updateSquiggles(uriString: string, diagnostics: IntelliSenseDiagnostic[], startNewSet: boolean): void {
@@ -2568,7 +2637,8 @@ export class DefaultClient implements Client {
                 }
                 let foundGlobMatch: boolean = false;
                 for (const assoc in assocs) {
-                    if (minimatch(filePath, assoc)) {
+                    const matcher = new minimatch.Minimatch(assoc);
+                    if (matcher.match(filePath)) {
                         foundGlobMatch = true;
                         break; // Assoc matched a glob pattern.
                     }
@@ -3238,11 +3308,11 @@ export class DefaultClient implements Client {
     /**
      * command handlers
      */
-    public async handleConfigurationSelectCommand(): Promise<void> {
+    public async handleConfigurationSelectCommand(config?: string): Promise<void> {
         await this.ready;
         const configNames: string[] | undefined = this.configuration.ConfigurationNames;
         if (configNames) {
-            const index: number = await ui.showConfigurations(configNames);
+            const index: number = config ? configNames.indexOf(config) : await ui.showConfigurations(configNames);
             if (index < 0) {
                 return;
             }
@@ -4007,6 +4077,14 @@ export class DefaultClient implements Client {
         compilerDefaults = await this.requestCompiler(path);
         DebugConfigurationProvider.ClearDetectedBuildTasks();
     }
+
+    public getHoverProvider(): HoverProvider | undefined {
+        return this.hoverProvider;
+    }
+
+    public getCopilotHoverProvider(): CopilotHoverProvider | undefined {
+        return this.copilotHoverProvider;
+    }
 }
 
 function getLanguageServerFileName(): string {
@@ -4118,6 +4196,8 @@ class NullClient implements Client {
     getShowConfigureIntelliSenseButton(): boolean { return false; }
     setShowConfigureIntelliSenseButton(show: boolean): void { }
     addTrustedCompiler(path: string): Promise<void> { return Promise.resolve(); }
-    getIncludes(maxDepth: number, token: vscode.CancellationToken): Promise<GetIncludesResult> { return Promise.resolve({} as GetIncludesResult); }
-    getChatContext(token: vscode.CancellationToken): Promise<ChatContextResult> { return Promise.resolve({} as ChatContextResult); }
+    getCopilotHoverProvider(): CopilotHoverProvider | undefined { return undefined; }
+    getIncludes(maxDepth: number): Promise<GetIncludesResult> { return Promise.resolve({} as GetIncludesResult); }
+    getChatContext(uri: vscode.Uri, token: vscode.CancellationToken): Promise<ChatContextResult> { return Promise.resolve({} as ChatContextResult); }
+    getProjectContext(uri: vscode.Uri): Promise<ProjectContextResult> { return Promise.resolve({} as ProjectContextResult); }
 }
